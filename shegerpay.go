@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -189,7 +190,7 @@ func (c *Client) request(method, path string, data url.Values, result interface{
 	
 	req.Header.Set("X-API-Key", c.apiKey)
 	req.Header.Set("User-Agent", "ShegerPay-Go-SDK/1.0")
-	if method == "POST" {
+	if data != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
 	
@@ -212,7 +213,54 @@ func (c *Client) request(method, path string, data url.Values, result interface{
 		json.Unmarshal(respBody, &errResp)
 		return errors.New(errResp["detail"])
 	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("shegerpay request failed: %s", string(respBody))
+	}
+	if resp.StatusCode == http.StatusNoContent || result == nil {
+		return nil
+	}
 	
+	return json.Unmarshal(respBody, result)
+}
+
+func (c *Client) requestJSON(method, path string, payload map[string]interface{}, result interface{}) error {
+	fullURL := c.baseURL + path
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(method, fullURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-API-Key", c.apiKey)
+	req.Header.Set("User-Agent", "ShegerPay-Go-SDK/1.0")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusNoContent || result == nil {
+		return nil
+	}
+	if resp.StatusCode == 401 {
+		return errors.New("invalid API key")
+	}
+	if resp.StatusCode >= 400 {
+		var errResp map[string]interface{}
+		json.Unmarshal(respBody, &errResp)
+		if detail, ok := errResp["detail"].(string); ok && detail != "" {
+			return errors.New(detail)
+		}
+		return fmt.Errorf("shegerpay request failed: %s", string(respBody))
+	}
 	return json.Unmarshal(respBody, result)
 }
 
@@ -267,10 +315,145 @@ func (c *Client) DeletePaymentLink(linkID string) error {
 	return c.request("DELETE", "/api/v1/payment-links/"+linkID, nil, &result)
 }
 
+// CreatePromoCode creates a reusable ShegerPay promo code. Requires a secret key and discount_codes entitlement.
+func (c *Client) CreatePromoCode(params map[string]interface{}) (map[string]interface{}, error) {
+	var result map[string]interface{}
+	err := c.requestJSON("POST", "/api/v1/promo-codes/", promoPayload(params), &result)
+	return result, err
+}
+
+// ListPromoCodes lists reusable promo codes for the merchant.
+func (c *Client) ListPromoCodes() ([]map[string]interface{}, error) {
+	var result []map[string]interface{}
+	err := c.request("GET", "/api/v1/promo-codes/", nil, &result)
+	return result, err
+}
+
+// UpdatePromoCode updates a reusable promo code.
+func (c *Client) UpdatePromoCode(codeID string, params map[string]interface{}) (map[string]interface{}, error) {
+	var result map[string]interface{}
+	err := c.requestJSON("PATCH", "/api/v1/promo-codes/"+codeID, promoPayload(params), &result)
+	return result, err
+}
+
+// DeletePromoCode deletes a reusable promo code.
+func (c *Client) DeletePromoCode(codeID string) error {
+	return c.request("DELETE", "/api/v1/promo-codes/"+codeID, nil, nil)
+}
+
+// ValidatePromoCode previews a promo code before payment. It does not consume usage.
+func (c *Client) ValidatePromoCode(code string, amount float64, opts map[string]interface{}) (map[string]interface{}, error) {
+	payload := map[string]interface{}{"code": code, "amount": amount}
+	for k, v := range opts {
+		payload[k] = v
+	}
+	var result map[string]interface{}
+	err := c.requestJSON("POST", "/api/v1/promo-codes/validate", payload, &result)
+	return result, err
+}
+
+// RedeemPromoCode consumes a promo code once after a verified transaction.
+func (c *Client) RedeemPromoCode(code string, amount float64, transactionID string, opts map[string]interface{}) (map[string]interface{}, error) {
+	payload := map[string]interface{}{"code": code, "amount": amount, "transaction_id": transactionID}
+	for k, v := range opts {
+		payload[k] = v
+	}
+	var result map[string]interface{}
+	err := c.requestJSON("POST", "/api/v1/promo-codes/redeem", payload, &result)
+	return result, err
+}
+
+// ApplyPaymentLinkCoupon previews a promo code against a ShegerPay payment link.
+func (c *Client) ApplyPaymentLinkCoupon(shortCode, code string, amount float64, quantity int, opts ...map[string]interface{}) (map[string]interface{}, error) {
+	payload := map[string]interface{}{"code": code, "quantity": quantity}
+	if amount > 0 {
+		payload["amount"] = amount
+	}
+	if len(opts) > 0 {
+		for k, v := range opts[0] {
+			payload[k] = v
+		}
+	}
+	var result map[string]interface{}
+	err := c.requestJSON("POST", "/api/v1/payment-links/"+shortCode+"/apply-coupon", payload, &result)
+	return result, err
+}
+
+// GetPaymentLinkOrderStatus returns the source-of-truth status for one checkout order.
+func (c *Client) GetPaymentLinkOrderStatus(shortCode, orderID string) (map[string]interface{}, error) {
+	var result map[string]interface{}
+	err := c.request("GET", "/api/v1/payment-links/"+shortCode+"/orders/"+orderID+"/status", nil, &result)
+	return result, err
+}
+
+func promoPayload(params map[string]interface{}) map[string]interface{} {
+	payload := map[string]interface{}{}
+	for k, v := range params {
+		switch k {
+		case "discountType":
+			payload["discount_type"] = v
+		case "discountValue":
+			payload["discount_value"] = v
+		case "discountPercent":
+			payload["discount_percent"] = v
+		case "maxDiscountAmount":
+			payload["max_discount_amount"] = v
+		case "minOrderAmount":
+			payload["min_order_amount"] = v
+		case "maxUses":
+			payload["max_uses"] = v
+		case "maxUsesPerCustomer":
+			payload["max_uses_per_customer"] = v
+		case "startsAt":
+			payload["starts_at"] = v
+		case "expiresAt":
+			payload["expires_at"] = v
+		case "appliesToLinkIds":
+			payload["applies_to_link_ids"] = v
+		case "allowedProviders":
+			payload["allowed_providers"] = v
+		default:
+			payload[k] = v
+		}
+	}
+	return payload
+}
+
 // VerifyWebhookSignature verifies a webhook signature
 func VerifyWebhookSignature(payload, signature, secret string) bool {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(payload))
 	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 	return hmac.Equal([]byte(expected), []byte(signature))
+}
+
+// VerifyRedirectSignature verifies signed payment-link redirect parameters.
+func VerifyRedirectSignature(params map[string]interface{}, signature, secret string) bool {
+	amount, _ := strconv.ParseFloat(fmt.Sprint(params["amount"]), 64)
+	payload := strings.Join([]string{
+		fmt.Sprint(firstRedirectParam(params, "checkout_session_id", "checkoutSessionId")),
+		fmt.Sprint(firstRedirectParam(params, "order_id", "orderId")),
+		fmt.Sprint(firstRedirectParam(params, "short_code", "shortCode")),
+		fmt.Sprintf("%.2f", amount),
+		redirectParamDefault(params, "currency", "ETB"),
+		redirectParamDefault(params, "status", "paid"),
+	}, "|")
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(payload))
+	expected := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(strings.TrimPrefix(signature, "sha256=")))
+}
+
+func firstRedirectParam(params map[string]interface{}, snake, camel string) interface{} {
+	if value, ok := params[snake]; ok && value != nil {
+		return value
+	}
+	return params[camel]
+}
+
+func redirectParamDefault(params map[string]interface{}, key, fallback string) string {
+	if value, ok := params[key]; ok && value != nil && fmt.Sprint(value) != "" {
+		return fmt.Sprint(value)
+	}
+	return fallback
 }
