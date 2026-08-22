@@ -1,4 +1,4 @@
-// ShegerPay Go SDK v2.2.0
+// ShegerPay Go SDK v2.2.1
 // Official Go SDK for ShegerPay Payment Verification Gateway
 //
 // Usage:
@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -27,7 +28,7 @@ import (
 )
 
 const (
-	Version        = "1.0.0"
+	Version        = "2.2.1"
 	DefaultBaseURL = "https://api.shegerpay.com"
 )
 
@@ -157,7 +158,8 @@ func (c *Client) Verify(params VerifyParams) (*VerificationResult, error) {
 	return result, err
 }
 
-// QuickVerify verifies with auto-detected provider
+// QuickVerify verifies with auto-detected provider. transactionID may be a typed
+// reference OR a raw scanned-QR payload — it is decoded server-side.
 func (c *Client) QuickVerify(transactionID string, amount float64) (*VerificationResult, error) {
 	data := url.Values{}
 	data.Set("transaction_id", transactionID)
@@ -189,7 +191,7 @@ func (c *Client) request(method, path string, data url.Values, result interface{
 	}
 	
 	req.Header.Set("X-API-Key", c.apiKey)
-	req.Header.Set("User-Agent", "ShegerPay-Go-SDK/1.0")
+	req.Header.Set("User-Agent", "ShegerPay-Go-SDK/"+Version)
 	if data != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
@@ -234,7 +236,7 @@ func (c *Client) requestJSON(method, path string, payload map[string]interface{}
 		return err
 	}
 	req.Header.Set("X-API-Key", c.apiKey)
-	req.Header.Set("User-Agent", "ShegerPay-Go-SDK/1.0")
+	req.Header.Set("User-Agent", "ShegerPay-Go-SDK/"+Version)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
@@ -264,20 +266,84 @@ func (c *Client) requestJSON(method, path string, payload map[string]interface{}
 	return json.Unmarshal(respBody, result)
 }
 
-// VerifyImage verifies a payment using a receipt screenshot (base64 or URL)
-func (c *Client) VerifyImage(imageData string, opts ...map[string]string) (*VerificationResult, error) {
-	params := url.Values{}
-	params.Set("image", imageData)
+// VerifyImage verifies a payment from a receipt image/screenshot (or PDF).
+//
+// Works for ANY supported bank — the backend reads the receipt's QR code (CBE,
+// Telebirr, BOA…) or OCRs the reference and auto-detects the provider. Just pass
+// the raw image bytes; no need to know the bank or pre-extract the reference.
+// Optional fields (amount, provider, transaction_id, merchant_name,
+// sender_account) may be passed via opts.
+func (c *Client) VerifyImage(screenshot []byte, opts ...map[string]string) (*VerificationResult, error) {
+	fields := map[string]string{}
 	if len(opts) > 0 {
 		for k, v := range opts[0] {
-			params.Set(k, v)
+			fields[k] = v
 		}
 	}
 	var result VerificationResult
-	if err := c.request("POST", "/api/v1/verify/image", params, &result); err != nil {
+	if err := c.requestMultipart("/api/v1/verify-image", fields, "screenshot", "receipt.png", screenshot, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
+}
+
+// requestMultipart POSTs multipart/form-data with a single file part plus any
+// extra form fields. Used by VerifyImage (the endpoint requires the file part
+// to be named exactly "screenshot").
+func (c *Client) requestMultipart(path string, fields map[string]string, fileField, fileName string, fileData []byte, result interface{}) error {
+	fullURL := c.baseURL + path
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for k, v := range fields {
+		if err := w.WriteField(k, v); err != nil {
+			return err
+		}
+	}
+	fw, err := w.CreateFormFile(fileField, fileName)
+	if err != nil {
+		return err
+	}
+	if _, err := fw.Write(fileData); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", fullURL, &buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-API-Key", c.apiKey)
+	req.Header.Set("User-Agent", "ShegerPay-Go-SDK/"+Version)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == 401 {
+		return errors.New("invalid API key")
+	}
+	if resp.StatusCode >= 400 {
+		var errResp map[string]interface{}
+		json.Unmarshal(respBody, &errResp)
+		if detail, ok := errResp["detail"].(string); ok && detail != "" {
+			return errors.New(detail)
+		}
+		return fmt.Errorf("shegerpay request failed: %s", string(respBody))
+	}
+	if resp.StatusCode == http.StatusNoContent || result == nil {
+		return nil
+	}
+	return json.Unmarshal(respBody, result)
 }
 
 // CreatePaymentLink creates a shareable payment link
@@ -301,12 +367,12 @@ func (c *Client) CreatePaymentLink(title string, amount float64, opts ...map[str
 // ListPaymentLinks returns all payment links for the account
 func (c *Client) ListPaymentLinks() ([]map[string]interface{}, error) {
 	var result struct {
-		Items []map[string]interface{} `json:"items"`
+		Links []map[string]interface{} `json:"links"`
 	}
 	if err := c.request("GET", "/api/v1/payment-links", nil, &result); err != nil {
 		return nil, err
 	}
-	return result.Items, nil
+	return result.Links, nil
 }
 
 // DeletePaymentLink deletes a payment link by ID
